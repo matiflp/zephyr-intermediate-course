@@ -1,0 +1,62 @@
+# Posts the homework review on a pull request, after "Homework checks" ran on it.
+#
+# workflow_run always runs this file from the default branch, with a write token,
+# so it treats everything from the PR as data:
+# - it checks out only this repository's default branch (the scripts),
+# - it reads result.json from the check run's artifact and the PR's file list
+#   through the API, and never builds or runs anything from the PR.
+#
+# Repository variables (optional): MANUAL_REVIEWER, the instructors asked to review
+# `needs-instructor` PRs and told when a check run left no result (`checks-not-run`:
+# fix the cause, then re-run the failed jobs), separated by commas or spaces, e.g.
+# "matiflp, carlassaraf" (default: nobody). Each one must have access to the repository;
+# CLOSE_APPROVED (default true).
+
+name: Homework review
+
+on:
+  workflow_run:
+    workflows: ['Homework checks']
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read         # download the check run's artifact
+  pull-requests: write  # post the review, close approved PRs
+  issues: write         # labels
+
+concurrency:
+  group: homework-review-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # The default branch's scripts only; nothing from the PR.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Data only: result.json and build logs from the check run.
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          name: homework-result
+          path: ${{ runner.temp }}/artifacts/homework-result
+        continue-on-error: true  # no artifact: post_review.py says the checks didn't finish
+
+      - name: Review and post
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_REVIEWER: ${{ vars.MANUAL_REVIEWER }}
+          CLOSE_APPROVED: ${{ vars.CLOSE_APPROVED }}
+        run: python3 .github/scripts/post_review.py --artifacts "$RUNNER_TEMP/artifacts"

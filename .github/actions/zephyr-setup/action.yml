@@ -1,0 +1,122 @@
+name: Zephyr setup
+description: >
+  Fetch Zephyr (and only the modules asked for) and the tools to build on native_sim,
+  or with the Zephyr SDK for a real board in QEMU. Expects the course repo checked out
+  at <workspace>/zephyr-course. Sets ZEPHYR_BASE (and the SDK variables when `sdk` is set).
+
+inputs:
+  workspace:
+    description: west workspace folder that holds the course repo as zephyr-course/
+    default: ws
+  manifest:
+    description: west manifest file, relative to the course repo
+    default: west.yml
+  projects:
+    description: west projects to fetch, space separated; zephyr first
+    default: zephyr
+  requirements:
+    description: Zephyr requirement sets to install, space separated (scripts/requirements-<name>.txt)
+    default: base
+  sdk:
+    description: Zephyr SDK toolchain to install (e.g. arm-zephyr-eabi), with the host tools (QEMU); empty for native_sim only
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Install host build tools
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends device-tree-compiler gcc-multilib g++-multilib gperf ninja-build
+
+    # Where west puts Zephyr (the manifest's `path`, or the project name), so the cache can restore it.
+    - name: Find the Zephyr folder
+      id: zephyr
+      shell: bash
+      working-directory: ${{ inputs.workspace }}
+      env:
+        MANIFEST: ${{ inputs.manifest }}
+      run: |
+        pip install west
+        path=$(python3 -c "import yaml, sys; p = next(p for p in yaml.safe_load(open(sys.argv[1]))['manifest']['projects'] if p['name'] == 'zephyr'); print(p.get('path', 'zephyr'))" "zephyr-course/$MANIFEST")
+        echo "path=$path" >> "$GITHUB_OUTPUT"
+
+    - name: Cache Zephyr
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ inputs.workspace }}/${{ steps.zephyr.outputs.path }}
+          ${{ inputs.workspace }}/modules
+        key: zephyr-src-${{ hashFiles(format('{0}/zephyr-course/{1}', inputs.workspace, inputs.manifest)) }}-${{ inputs.projects }}
+
+    - name: Fetch Zephyr
+      shell: bash
+      working-directory: ${{ inputs.workspace }}
+      env:
+        MANIFEST: ${{ inputs.manifest }}
+        PROJECTS: ${{ inputs.projects }}
+        ZEPHYR_PATH: ${{ steps.zephyr.outputs.path }}
+      # `west update <name>` refuses projects that come from Zephyr's own manifest (an `import`, as the
+      # modules in L7's docker/west.yml), so west fetches the first project (zephyr) and git fetches
+      # the rest, each at the revision the resolved manifest pins.
+      run: |
+        west init -l --mf "$MANIFEST" zephyr-course
+        first=${PROJECTS%% *}
+        west update --narrow -o=--depth=1 "$first"
+        for p in ${PROJECTS#"$first"}; do
+          read -r url rev path < <(west list -f "{url} {revision} {path}" "$p")
+          if [ "$(git -C "$path" rev-parse -q --verify HEAD 2>/dev/null)" = "$rev" ]; then
+            continue  # restored from the cache
+          fi
+          [ -d "$path/.git" ] || { git init -q "$path"; git -C "$path" remote add origin "$url"; }
+          git -C "$path" fetch -q --depth 1 origin "$rev"
+          git -C "$path" checkout -q --detach FETCH_HEAD
+          echo "$p: $(git -C "$path" rev-parse --short HEAD) in $path"
+        done
+        echo "ZEPHYR_BASE=$PWD/$ZEPHYR_PATH" >> "$GITHUB_ENV"
+
+    # Before `west zephyr-export`: Zephyr's west commands import these packages (jsonschema, ...).
+    - name: Install Zephyr Python requirements
+      shell: bash
+      working-directory: ${{ inputs.workspace }}
+      env:
+        REQUIREMENTS: ${{ inputs.requirements }}
+        ZEPHYR_PATH: ${{ steps.zephyr.outputs.path }}
+      run: |
+        args=()
+        for r in $REQUIREMENTS; do args+=(-r "$ZEPHYR_PATH/scripts/requirements-$r.txt"); done
+        pip install "${args[@]}"
+        west zephyr-export
+
+    - name: Find the SDK version
+      id: sdk
+      if: inputs.sdk != ''
+      shell: bash
+      run: echo "version=$(cat "$ZEPHYR_BASE/SDK_VERSION")" >> "$GITHUB_OUTPUT"
+
+    - name: Cache the Zephyr SDK
+      if: inputs.sdk != ''
+      uses: actions/cache@v4
+      with:
+        path: ~/zephyr-sdk-${{ steps.sdk.outputs.version }}
+        key: zephyr-sdk-${{ steps.sdk.outputs.version }}-${{ inputs.sdk }}
+
+    # The minimal bundle plus one toolchain and the host tools (QEMU).
+    - name: Install the Zephyr SDK
+      if: inputs.sdk != ''
+      shell: bash
+      env:
+        VERSION: ${{ steps.sdk.outputs.version }}
+        TOOLCHAIN: ${{ inputs.sdk }}
+      run: |
+        dir="$HOME/zephyr-sdk-$VERSION"
+        if [ ! -x "$dir/$TOOLCHAIN/bin/$TOOLCHAIN-gcc" ]; then
+          cd "$HOME"
+          curl -sSfL -o sdk.tar.xz \
+            "https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v$VERSION/zephyr-sdk-${VERSION}_linux-x86_64_minimal.tar.xz"
+          tar xf sdk.tar.xz && rm sdk.tar.xz
+          "$dir/setup.sh" -t "$TOOLCHAIN" -h -c
+        fi
+        echo "ZEPHYR_SDK_INSTALL_DIR=$dir" >> "$GITHUB_ENV"
+        echo "ZEPHYR_TOOLCHAIN_VARIANT=zephyr" >> "$GITHUB_ENV"

@@ -1,0 +1,263 @@
+# Automatic checks for homework tasks.
+#
+# Runs on a pull request from a task branch (the submission flow, see HOMEWORK.md),
+# and on a push of a task branch in a student's fork (when Actions is enabled there).
+# Only the job for that task runs. Results show in the run's summary page and as
+# annotations on the files that need changes. On a pull request, the
+# "Homework review" workflow then posts them on the PR.
+#
+# This job builds and runs the student's code, so it must never get secrets: it
+# runs with a read-only token, and pull_request runs from forks get no secrets.
+# On a pull request the checks' scripts come from the target branch (see "Use the
+# checks from the target branch"), so fixing them there and re-running is enough.
+
+name: Homework checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: ['l*-task*']
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'Task to check, e.g. l8-task1 (defaults to the selected ref name)'
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homework-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The task branch, also on pull requests (where GITHUB_REF_NAME is "<n>/merge").
+  HOMEWORK_REF: ${{ github.head_ref || inputs.task || github.ref_name }}
+
+jobs:
+  # Works out the task from the branch name: l8-task1, l8-task1-fix, ...
+  task:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      task: ${{ steps.task.outputs.task }}
+    steps:
+      - name: Pick the task from the branch name
+        id: task
+        run: |
+          task=""
+          if [[ "$HOMEWORK_REF" =~ ^(l[1-8]-task[0-3])($|[^0-9]) ]]; then
+            case "${BASH_REMATCH[1]}" in
+              l1-task1|l2-task1|l3-task1|l4-task1|l5-task1|l6-task1|l7-task1|l8-task0|l8-task1|l8-task2|l8-task3)
+                task=${BASH_REMATCH[1]} ;;
+            esac
+          fi
+          echo "task=$task" >> "$GITHUB_OUTPUT"
+          if [ -z "$task" ]; then
+            echo "::warning::\`$HOMEWORK_REF\` is not a task name. Name the branch after the task, e.g. \`l8-task1\`."
+            printf '## No task\n\n`%s` is not a task name. Name the branch after the task, e.g. `l8-task1`.\n' "$HOMEWORK_REF" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Task: $task"
+          fi
+
+  # l1-task1 to l6-task1: the checker reads the code, builds app/ for native_sim, runs it for a
+  # few seconds of simulated time and reads the task's fixed log lines (TASKS.md).
+  native-sim:
+    needs: task
+    if: contains(fromJSON('["l1-task1","l2-task1","l3-task1","l4-task1","l5-task1","l6-task1"]'), needs.task.outputs.task)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ws
+    env:
+      # native_sim builds with the runner's gcc; no Zephyr SDK download needed.
+      ZEPHYR_TOOLCHAIN_VARIANT: host
+      TASK: ${{ needs.task.outputs.task }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ws/zephyr-course
+
+      # The checks (scripts and setup action) come from the branch the PR targets as it is now, not
+      # from the PR's merge commit: a fix pushed there applies to the next run, "Re-run" included,
+      # and a PR can't change how it is checked. (This workflow file itself still comes from the
+      # merge commit; GitHub picks it before any step runs.)
+      - name: Use the checks from the target branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git -C zephyr-course fetch --quiet --depth 1 origin "$BASE_REF"
+          rm -rf zephyr-course/.github
+          git -C zephyr-course checkout FETCH_HEAD -- .github
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: ./ws/zephyr-course/.github/actions/zephyr-setup
+        with:
+          requirements: base build-test run-test
+
+      # The course's test for L2 comes from the branch the PR targets, so a PR can't change it.
+      - name: Use the course's tests
+        if: github.event_name == 'pull_request' && needs.task.outputs.task == 'l2-task1'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git -C zephyr-course fetch --quiet --depth 1 origin "$BASE_REF"
+          rm -rf zephyr-course/tests/l2_counter
+          git -C zephyr-course checkout FETCH_HEAD -- tests/l2_counter
+
+      - name: Check the task
+        run: python3 "zephyr-course/.github/scripts/check_${TASK//-/_}.py" --root zephyr-course --work . --json result.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: homework-result
+          path: |
+            ws/result.json
+            ws/build.log
+          if-no-files-found: ignore
+
+  # l7-task1: Zephyr 3.7.2 (the starter's docker/west.yml) built for mps2/an521 with the Zephyr SDK,
+  # then run in QEMU to see the attack fault.
+  l7:
+    needs: task
+    if: needs.task.outputs.task == 'l7-task1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: ws
+    env:
+      TASK: ${{ needs.task.outputs.task }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ws/zephyr-course
+
+      # The checks (scripts and setup action) come from the branch the PR targets as it is now, not
+      # from the PR's merge commit: a fix pushed there applies to the next run, "Re-run" included,
+      # and a PR can't change how it is checked. (This workflow file itself still comes from the
+      # merge commit; GitHub picks it before any step runs.)
+      - name: Use the checks from the target branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git -C zephyr-course fetch --quiet --depth 1 origin "$BASE_REF"
+          rm -rf zephyr-course/.github
+          git -C zephyr-course checkout FETCH_HEAD -- .github
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: ./ws/zephyr-course/.github/actions/zephyr-setup
+        with:
+          manifest: docker/west.yml
+          projects: zephyr cmsis
+          sdk: arm-zephyr-eabi
+
+      - name: Check the task
+        run: python3 zephyr-course/.github/scripts/check_l7_task1.py --root zephyr-course --work . --json result.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: homework-result
+          path: |
+            ws/result.json
+            ws/build.log
+          if-no-files-found: ignore
+
+  # l8-task0 (the fake), l8-task1/2 (the tests) and l8-task3 (coverage) share the build.
+  # Task 1 to 3 also run the student's tests against broken copies of temp_alarm.c.
+  l8:
+    needs: task
+    if: startsWith(needs.task.outputs.task, 'l8-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ws
+    env:
+      # native_sim builds with the runner's gcc; no Zephyr SDK download needed.
+      ZEPHYR_TOOLCHAIN_VARIANT: host
+      TASK: ${{ needs.task.outputs.task }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ws/zephyr-course
+
+      # The checks (scripts and setup action) come from the branch the PR targets as it is now, not
+      # from the PR's merge commit: a fix pushed there applies to the next run, "Re-run" included,
+      # and a PR can't change how it is checked. (This workflow file itself still comes from the
+      # merge commit; GitHub picks it before any step runs.)
+      - name: Use the checks from the target branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git -C zephyr-course fetch --quiet --depth 1 origin "$BASE_REF"
+          rm -rf zephyr-course/.github
+          git -C zephyr-course checkout FETCH_HEAD -- .github
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: ./ws/zephyr-course/.github/actions/zephyr-setup
+        with:
+          requirements: base build-test run-test
+
+      # The module under test and the test project's build files come from the branch the PR
+      # targets, so a PR can't change what the tests run against.
+      - name: Use the course's module and test project
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git -C zephyr-course fetch --quiet --depth 1 origin "$BASE_REF"
+          rm -rf zephyr-course/app/modules/temp_alarm
+          git -C zephyr-course checkout FETCH_HEAD -- app/modules/temp_alarm \
+            tests/temp_alarm/CMakeLists.txt tests/temp_alarm/testcase.yaml tests/temp_alarm/prj.conf tests/temp_alarm/Kconfig
+
+      # Compiler warnings in the student's tests are not failures, hence --disable-warnings-as-errors.
+      - name: Run the temp_alarm tests
+        continue-on-error: true  # the check step turns the results into feedback
+        run: |
+          coverage=()
+          if [ "$TASK" = l8-task3 ]; then
+            coverage=(--coverage --coverage-tool gcovr --gcov-tool gcov --coverage-basedir zephyr-course/app/modules/temp_alarm)
+          fi
+          west twister -T zephyr-course/tests/temp_alarm -p native_sim --outdir twister-out --inline-logs \
+            --disable-warnings-as-errors "${coverage[@]}"
+
+      - name: Run the tests against broken copies of temp_alarm.c
+        if: needs.task.outputs.task != 'l8-task0'
+        continue-on-error: true  # the check step reports a run that didn't finish
+        run: >
+          python3 zephyr-course/.github/scripts/l8_mutants.py --root zephyr-course --task "$TASK"
+          --build-dir mutants-build --json mutants.json
+
+      - name: Check the tests
+        run: >
+          python3 "zephyr-course/.github/scripts/check_${TASK//-/_}.py" --root zephyr-course
+          --twister-out twister-out --mutants mutants.json --platform native_sim --json result.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: homework-result
+          path: |
+            ws/result.json
+            ws/mutants.json
+            ws/twister-out/twister.json
+            ws/twister-out/coverage_summary.json
+            ws/twister-out/coverage/
+          if-no-files-found: ignore
